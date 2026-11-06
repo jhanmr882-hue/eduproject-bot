@@ -195,7 +195,7 @@ def dist_text(dist):
 WELCOME = (
     "Assalomu alaykum! 👋\n\n"
     "Maktabimizning loyihalar platformasiga xush kelibsiz!\n"
-    "Bu bot orqali loyihalarda qatnashish учун ro'yxatdan o'tishingiz mumkin.\n\n"
+    "Bu bot orqali loyihalarda qatnashish uchun ro'yxatdan o'tishingiz mumkin.\n\n"
     "<b>Kerakli bo'limni tanlang:</b>"
 )
 
@@ -323,7 +323,7 @@ async def menu_reg(c: CallbackQuery, state: FSMContext):
     await state.clear()
     ps = q("SELECT * FROM projects WHERE status='active' ORDER BY id DESC")
     if not ps:
-        await show(c, "Hozircha ro'yxatdan o'tish учун faol loyiha yo'q.", home_kb())
+        await show(c, "Hozircha ro'yxatdan o'tish uchun faol loyiha yo'q.", home_kb())
         await c.answer()
         return
     b = InlineKeyboardBuilder()
@@ -366,7 +366,7 @@ async def reg_go(c: CallbackQuery, state: FSMContext):
         await c.answer("Siz bu loyihaga allaqachon ro'yxatdan o'tgansiz.", show_alert=True)
         return
     if seats_left(pid) <= 0:
-        await c.answer("Afsuski, bu loyiha учун barcha joylar to'lgan.", show_alert=True)
+        await c.answer("Afsuski, bu loyiha uchun barcha joylar to'lgan.", show_alert=True)
         return
     try:
         await c.message.edit_reply_markup(reply_markup=None)
@@ -595,7 +595,6 @@ def preview_kb():
     b.adjust(1)
     return b.as_markup()
 
-
 @admin.callback_query(NewProject.confirm, F.data.in_({"np:ok", "np:edit", "np:back"}))
 async def new_project_actions(c: CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -603,17 +602,20 @@ async def new_project_actions(c: CallbackQuery, state: FSMContext):
     
     if c.data == "np:back":
         await state.set_state(NewProject.classes)
-        await show(c, "🏫 <b>Qaysi sinflar qatnashadi?</b>", classes_kb(sel))
+        try:
+            await c.message.edit_text("🏫 <b>Qaysi sinflar qatnashadi?</b>", reply_markup=classes_kb(sel))
+        except Exception:
+            await c.message.answer("🏫 <b>Qaysi sinflar qatnashadi?</b>", reply_markup=classes_kb(sel))
         await c.answer()
         
     elif c.data == "np:edit":
         example = ", ".join(f"{k}={v}" for k, v in split_seats(sorted(sel), TOTAL_SEATS).items())
         await state.set_state(NewProject.limits)
-        await show(
-            c,
-            f"✏️ Har bir sinf uchun joy sonini yozing. Yig'indi aynan <b>{TOTAL_SEATS}</b> bo'lishi kerak.\n\n"
-            f"Namuna:\n<code>{example}</code>",
-        )
+        text = f"✏️ Har bir sinf uchun joy sonini yozing. Yig'indi aynan <b>{TOTAL_SEATS}</b> bo'lishi kerak.\n\nNamuna:\n<code>{example}</code>"
+        try:
+            await c.message.edit_text(text)
+        except Exception:
+            await c.message.answer(text)
         await c.answer()
         
     elif c.data == "np:ok":
@@ -631,9 +633,23 @@ async def new_project_actions(c: CallbackQuery, state: FSMContext):
         b.button(text="📣 Hammaga e'lon qilish", callback_data=f"ann:{pid}")
         b.button(text="🛡 Admin panel", callback_data="adm:home")
         b.adjust(1)
-        await show(c, f"✅ <b>Loyiha yaratildi!</b>\n\n{project_text(p)}", b.as_markup())
+        text = f"✅ <b>Loyiha yaratildi!</b>\n\n{project_text(p)}"
+        try:
+            await c.message.edit_text(text, reply_markup=b.as_markup())
+        except Exception:
+            await c.message.answer(text, reply_markup=b.as_markup())
         await c.answer()
 
+@admin.message(NewProject.limits, F.text, ~F.text.startswith("/"))
+async def np_limits(m: Message, state: FSMContext):
+    sel = (await state.get_data()).get("sel", [])
+    dist, err = parse_limits(m.text, sel, TOTAL_SEATS)
+    if err:
+        await m.answer(f"⚠️ {err}")
+        return
+    await state.update_data(dist={str(k): v for k, v in dist.items()})
+    await state.set_state(NewProject.confirm)
+    await m.answer(preview_text(dist), reply_markup=preview_kb())
 
 # ---- Loyihalar ro'yxati va boshqaruv
 @admin.callback_query(F.data == "adm:list")
