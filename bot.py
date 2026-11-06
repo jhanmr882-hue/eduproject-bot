@@ -12,6 +12,7 @@ import io
 import logging
 import os
 import re
+import sqlite3
 import psycopg2
 from datetime import datetime
 from html import escape as esc
@@ -57,21 +58,33 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.executescript(
+    cur.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
             tg_id BIGINT PRIMARY KEY,
             created_at TEXT
         );
+        """
+    )
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS projects (
             id SERIAL PRIMARY KEY,
             name TEXT, date TEXT, time TEXT, place TEXT,
             total INTEGER, status TEXT DEFAULT 'active', created_at TEXT
         );
+        """
+    )
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS project_classes (
             project_id INTEGER, class INTEGER, seats INTEGER,
             PRIMARY KEY (project_id, class)
         );
+        """
+    )
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS registrations (
             id SERIAL PRIMARY KEY,
             project_id INTEGER, tg_id BIGINT, username TEXT,
@@ -89,11 +102,9 @@ init_db()
 def q(sql, args=()):
     conn = get_db_connection()
     cur = conn.cursor()
-    # psycopg2 da %s ishlatiladi (agar kodda ? bo'lsa, ularni %s ga o'zgartirish kerak)
     sql = sql.replace("?", "%s")
     cur.execute(sql, args)
     rows = cur.fetchall()
-    # Dict formatida olish uchun
     col_names = [desc[0] for desc in cur.description] if cur.description else []
     result = [dict(zip(col_names, row)) for row in rows]
     cur.close()
@@ -113,6 +124,55 @@ def run(sql, args=()):
     cur.close()
     conn.close()
     return cur
+
+def now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+def class_stats(pid):
+    return q(
+        """
+        SELECT pc.class AS cls, pc.seats,
+               COALESCE(COUNT(r.id), 0) AS taken
+        FROM project_classes pc
+        LEFT JOIN registrations r ON r.project_id = pc.project_id AND r.class = pc.class
+        WHERE pc.project_id = %s
+        GROUP BY pc.class, pc.seats
+        ORDER BY pc.class
+        """,
+        (pid,),
+    )
+
+def seats_left(pid):
+    st = class_stats(pid)
+    total_seats = sum(r["seats"] for r in st)
+    total_taken = sum(r["taken"] for r in st)
+    return total_seats - total_taken
+
+def split_seats(classes, total):
+    if not classes:
+        return {}
+    n = len(classes)
+    base = total // n
+    rem = total % n
+    res = {}
+    for i, c in enumerate(sorted(classes)):
+        res[c] = base + (1 if i < rem else 0)
+    return res
+
+def parse_limits(text, classes, total):
+    parts = [p.strip() for p in text.replace(",", " ").split() if p.strip()]
+    dist = {}
+    for p in parts:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            if k.isdigit() and v.isdigit():
+                dist[int(k)] = int(v)
+    if set(dist.keys()) != set(classes):
+        return None, f"Faqat quyidagi sinflarni ko'rsating: {', '.join(map(str, sorted(classes)))}"
+    if sum(dist.values()) != total:
+        return None, f"Joylar yig'indisi {sum(dist.values())} ga teng. Exactly {total} bo'lishi kerak!"
+    return dist, None
+
 # ----------------------------------------------------------------- MATNLAR
 def project_text(p, with_seats=True):
     t = (
@@ -128,19 +188,16 @@ def project_text(p, with_seats=True):
         t += "\n".join(f"• {r['cls']}-sinf: {r['taken']}/{r['seats']}" for r in st)
     return t
 
-
 def dist_text(dist):
     lines = "\n".join(f"• {c}-sinf: {n} ta joy" for c, n in sorted(dist.items()))
     return f"{lines}\n<b>Jami: {sum(dist.values())} ta</b>"
 
-
 WELCOME = (
     "Assalomu alaykum! 👋\n\n"
     "Maktabimizning loyihalar platformasiga xush kelibsiz!\n"
-    "Bu bot orqali loyihalarda qatnashish uchun ro'yxatdan o'tishingiz mumkin.\n\n"
+    "Bu bot orqali loyihalarda qatnashish учун ro'yxatdan o'tishingiz mumkin.\n\n"
     "<b>Kerakli bo'limni tanlang:</b>"
 )
-
 
 # ----------------------------------------------------------------- KLAVIATURALAR
 def main_menu(uid):
@@ -154,12 +211,10 @@ def main_menu(uid):
     b.adjust(1)
     return b.as_markup()
 
-
 def home_kb():
     b = InlineKeyboardBuilder()
     b.button(text="🏠 Asosiy menyu", callback_data="menu:home")
     return b.as_markup()
-
 
 def admin_home_kb():
     b = InlineKeyboardBuilder()
@@ -168,7 +223,6 @@ def admin_home_kb():
     b.button(text="🏠 Asosiy menyu", callback_data="menu:home")
     b.adjust(1)
     return b.as_markup()
-
 
 def project_kb(pid, status="active"):
     b = InlineKeyboardBuilder()
@@ -183,7 +237,6 @@ def project_kb(pid, status="active"):
     b.adjust(1)
     return b.as_markup()
 
-
 def classes_kb(sel):
     b = InlineKeyboardBuilder()
     for c in CLASSES:
@@ -193,7 +246,6 @@ def classes_kb(sel):
     b.row(InlineKeyboardButton(text="➡️ Davom etish", callback_data="sel:done"))
     return b.as_markup()
 
-
 async def show(c: CallbackQuery, text, kb=None):
     try:
         await c.message.edit_text(text, reply_markup=kb)
@@ -201,10 +253,8 @@ async def show(c: CallbackQuery, text, kb=None):
         if "not modified" not in str(e):
             await c.message.answer(text, reply_markup=kb)
 
-
 def valid_name(t):
     return 2 <= len(t) <= 30 and not any(ch.isdigit() for ch in t)
-
 
 async def send_many(bot: Bot, ids, text):
     ok = fail = 0
@@ -217,20 +267,16 @@ async def send_many(bot: Bot, ids, text):
         await asyncio.sleep(0.05)
     return ok, fail
 
-
 # =================================================================== O'QUVCHI
 router = Router()
-
 
 class Reg(StatesGroup):
     first = State()
     last = State()
     cls = State()
 
-
 def remember_user(uid):
-    run("INSERT OR IGNORE INTO users(tg_id, created_at) VALUES(?, ?)", (uid, now()))
-
+    run("INSERT INTO users(tg_id, created_at) VALUES(?, ?) ON CONFLICT (tg_id) DO NOTHING", (uid, now()))
 
 @router.message(CommandStart())
 async def cmd_start(m: Message, state: FSMContext):
@@ -238,12 +284,10 @@ async def cmd_start(m: Message, state: FSMContext):
     remember_user(m.from_user.id)
     await m.answer(WELCOME, reply_markup=main_menu(m.from_user.id))
 
-
 @router.message(Command("cancel"))
 async def cmd_cancel(m: Message, state: FSMContext):
     await state.clear()
     await m.answer("Bekor qilindi.", reply_markup=main_menu(m.from_user.id))
-
 
 @router.callback_query(F.data == "menu:home")
 async def menu_home(c: CallbackQuery, state: FSMContext):
@@ -251,7 +295,6 @@ async def menu_home(c: CallbackQuery, state: FSMContext):
     remember_user(c.from_user.id)
     await show(c, WELCOME, main_menu(c.from_user.id))
     await c.answer()
-
 
 @router.callback_query(F.data == "menu:about")
 async def menu_about(c: CallbackQuery, state: FSMContext):
@@ -264,7 +307,6 @@ async def menu_about(c: CallbackQuery, state: FSMContext):
     )
     await c.answer()
 
-
 @router.callback_query(F.data == "menu:projects")
 async def menu_projects(c: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -276,13 +318,12 @@ async def menu_projects(c: CallbackQuery, state: FSMContext):
         await show(c, text, home_kb())
     await c.answer()
 
-
 @router.callback_query(F.data == "menu:reg")
 async def menu_reg(c: CallbackQuery, state: FSMContext):
     await state.clear()
     ps = q("SELECT * FROM projects WHERE status='active' ORDER BY id DESC")
     if not ps:
-        await show(c, "Hozircha ro'yxatdan o'tish uchun faol loyiha yo'q.", home_kb())
+        await show(c, "Hozircha ro'yxatdan o'tish учун faol loyiha yo'q.", home_kb())
         await c.answer()
         return
     b = InlineKeyboardBuilder()
@@ -292,7 +333,6 @@ async def menu_reg(c: CallbackQuery, state: FSMContext):
     b.adjust(1)
     await show(c, "Qaysi loyihaga ro'yxatdan o'tmoqchisiz?", b.as_markup())
     await c.answer()
-
 
 @router.callback_query(F.data.startswith("reg:"))
 async def reg_start(c: CallbackQuery, state: FSMContext):
@@ -308,11 +348,35 @@ async def reg_start(c: CallbackQuery, state: FSMContext):
         await c.answer("Afsuski, bu loyiha uchun barcha joylar to'lgan.", show_alert=True)
         return
     await state.clear()
-    await state.set_state(Reg.first)
-    await state.update_data(pid=pid)
-    await show(c, f"{project_text(p, False)}\n\n✍️ <b>Ismingizni kiriting:</b>\n(Bekor qilish: /cancel)")
+    b = InlineKeyboardBuilder()
+    b.button(text="📝 Ro'yxatdan o'tish", callback_data=f"go:{pid}")
+    b.button(text="🏠 Asosiy menyu", callback_data="menu:home")
+    b.adjust(1)
+    await show(c, project_text(p, False), b.as_markup())
     await c.answer()
 
+@router.callback_query(F.data.startswith("go:"))
+async def reg_go(c: CallbackQuery, state: FSMContext):
+    pid = int(c.data.split(":")[1])
+    p = q1("SELECT * FROM projects WHERE id=? AND status='active'", (pid,))
+    if not p:
+        await c.answer("Bu loyiha yopilgan.", show_alert=True)
+        return
+    if q1("SELECT 1 FROM registrations WHERE project_id=? AND tg_id=?", (pid, c.from_user.id)):
+        await c.answer("Siz bu loyihaga allaqachon ro'yxatdan o'tgansiz.", show_alert=True)
+        return
+    if seats_left(pid) <= 0:
+        await c.answer("Afsuski, bu loyiha учун barcha joylar to'lgan.", show_alert=True)
+        return
+    try:
+        await c.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    await state.clear()
+    await state.set_state(Reg.first)
+    await state.update_data(pid=pid)
+    await c.message.answer("✍️ <b>Ismingizni kiriting:</b>\n(Bekor qilish: /cancel)")
+    await c.answer()
 
 @router.message(Reg.first, F.text, ~F.text.startswith("/"))
 async def reg_first(m: Message, state: FSMContext):
@@ -323,7 +387,6 @@ async def reg_first(m: Message, state: FSMContext):
     await state.update_data(first=name)
     await state.set_state(Reg.last)
     await m.answer("✍️ <b>Familiyangizni kiriting:</b>")
-
 
 @router.message(Reg.last, F.text, ~F.text.startswith("/"))
 async def reg_last(m: Message, state: FSMContext):
@@ -343,7 +406,6 @@ async def reg_last(m: Message, state: FSMContext):
     b.adjust(2)
     await state.set_state(Reg.cls)
     await m.answer("🏫 <b>Sinfingizni tanlang:</b>", reply_markup=b.as_markup())
-
 
 @router.callback_query(Reg.cls, F.data.startswith("cls:"))
 async def reg_class(c: CallbackQuery, state: FSMContext):
@@ -372,7 +434,7 @@ async def reg_class(c: CallbackQuery, state: FSMContext):
             " VALUES(?,?,?,?,?,?,?)",
             (pid, c.from_user.id, c.from_user.username or "", data["first"], data["last"], cls, now()),
         )
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
         await state.clear()
         await c.answer("Siz allaqachon ro'yxatdan o'tgansiz.", show_alert=True)
         return
@@ -388,7 +450,6 @@ async def reg_class(c: CallbackQuery, state: FSMContext):
         home_kb(),
     )
     await c.answer()
-
 
 def my_regs_view(uid):
     rows = q(
@@ -414,14 +475,12 @@ def my_regs_view(uid):
     b.adjust(1)
     return "👤 <b>Mening ro'yxatdan o'tishlarim</b>\n\n" + "\n\n".join(parts), b.as_markup()
 
-
 @router.callback_query(F.data == "menu:my")
 async def menu_my(c: CallbackQuery, state: FSMContext):
     await state.clear()
     text, kb = my_regs_view(c.from_user.id)
     await show(c, text, kb)
     await c.answer()
-
 
 @router.callback_query(F.data.startswith("cancel:"))
 async def cancel_reg(c: CallbackQuery):
@@ -435,12 +494,10 @@ async def cancel_reg(c: CallbackQuery):
     text, kb = my_regs_view(c.from_user.id)
     await show(c, text, kb)
 
-
 # =================================================================== ADMIN
 admin = Router()
 admin.message.filter(F.from_user.id.in_(ADMIN_IDS))
 admin.callback_query.filter(F.from_user.id.in_(ADMIN_IDS))
-
 
 class NewProject(StatesGroup):
     name = State()
@@ -451,27 +508,22 @@ class NewProject(StatesGroup):
     confirm = State()
     limits = State()
 
-
 class EditLimits(StatesGroup):
     limits = State()
 
-
 class Broadcast(StatesGroup):
     text = State()
-
 
 @admin.message(Command("admin"))
 async def admin_cmd(m: Message, state: FSMContext):
     await state.clear()
     await m.answer("🛡 <b>Admin panel</b>", reply_markup=admin_home_kb())
 
-
 @admin.callback_query(F.data == "adm:home")
 async def admin_home(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await show(c, "🛡 <b>Admin panel</b>", admin_home_kb())
     await c.answer()
-
 
 # ---- Yangi loyiha
 @admin.callback_query(F.data == "adm:new")
@@ -481,13 +533,11 @@ async def new_start(c: CallbackQuery, state: FSMContext):
     await show(c, "➕ <b>Yangi loyiha</b>\n\nLoyiha nomini yozing (masalan: Zakovat):\n(Bekor qilish: /cancel)")
     await c.answer()
 
-
 @admin.message(NewProject.name, F.text, ~F.text.startswith("/"))
 async def new_name(m: Message, state: FSMContext):
     await state.update_data(name=m.text.strip())
     await state.set_state(NewProject.date)
     await m.answer("📅 Sanani yozing (masalan: 20-dekabr):")
-
 
 @admin.message(NewProject.date, F.text, ~F.text.startswith("/"))
 async def new_date(m: Message, state: FSMContext):
@@ -495,13 +545,11 @@ async def new_date(m: Message, state: FSMContext):
     await state.set_state(NewProject.time)
     await m.answer("🕒 Vaqtni yozing (masalan: 13:00):")
 
-
 @admin.message(NewProject.time, F.text, ~F.text.startswith("/"))
 async def new_time(m: Message, state: FSMContext):
     await state.update_data(time=m.text.strip())
     await state.set_state(NewProject.place)
     await m.answer("📍 Manzilni yozing (masalan: Maktab kutubxonasi):")
-
 
 @admin.message(NewProject.place, F.text, ~F.text.startswith("/"))
 async def new_place(m: Message, state: FSMContext):
@@ -512,7 +560,6 @@ async def new_place(m: Message, state: FSMContext):
         "tanlangan sinflarga teng taqsimlanadi (keyin o'zgartirishingiz mumkin).",
         reply_markup=classes_kb([]),
     )
-
 
 @admin.callback_query(NewProject.classes, F.data.startswith("sel:"))
 async def new_select(c: CallbackQuery, state: FSMContext):
@@ -537,10 +584,8 @@ async def new_select(c: CallbackQuery, state: FSMContext):
     await show(c, "🏫 <b>Qaysi sinflar qatnashadi?</b>", classes_kb(sel))
     await c.answer()
 
-
 def preview_text(dist):
     return f"📊 <b>Joylar taqsimoti</b>\n\n{dist_text(dist)}\n\nTasdiqlaysizmi?"
-
 
 def preview_kb():
     b = InlineKeyboardBuilder()
@@ -550,14 +595,12 @@ def preview_kb():
     b.adjust(1)
     return b.as_markup()
 
-
 @admin.callback_query(NewProject.confirm, F.data == "np:back")
 async def np_back(c: CallbackQuery, state: FSMContext):
     sel = (await state.get_data()).get("sel", [])
     await state.set_state(NewProject.classes)
     await show(c, "🏫 <b>Qaysi sinflar qatnashadi?</b>", classes_kb(sel))
     await c.answer()
-
 
 @admin.callback_query(NewProject.confirm, F.data == "np:edit")
 async def np_edit(c: CallbackQuery, state: FSMContext):
@@ -571,7 +614,6 @@ async def np_edit(c: CallbackQuery, state: FSMContext):
     )
     await c.answer()
 
-
 @admin.message(NewProject.limits, F.text, ~F.text.startswith("/"))
 async def np_limits(m: Message, state: FSMContext):
     sel = (await state.get_data()).get("sel", [])
@@ -583,18 +625,16 @@ async def np_limits(m: Message, state: FSMContext):
     await state.set_state(NewProject.confirm)
     await m.answer(preview_text(dist), reply_markup=preview_kb())
 
-
 @admin.callback_query(NewProject.confirm, F.data == "np:ok")
 async def np_ok(c: CallbackQuery, state: FSMContext):
     d = await state.get_data()
-    cur = conn.execute(
-        "INSERT INTO projects(name, date, time, place, total, status, created_at) VALUES(?,?,?,?,?,'active',?)",
+    row = q1(
+        "INSERT INTO projects(name, date, time, place, total, status, created_at) VALUES(?,?,?,?,?,'active',?) RETURNING id",
         (d["name"], d["date"], d["time"], d["place"], TOTAL_SEATS, now()),
     )
-    pid = cur.lastrowid
+    pid = row["id"]
     for cls, seats in d["dist"].items():
-        conn.execute("INSERT INTO project_classes(project_id, class, seats) VALUES(?,?,?)", (pid, int(cls), seats))
-    conn.commit()
+        run("INSERT INTO project_classes(project_id, class, seats) VALUES(?,?,?)", (pid, int(cls), seats))
     await state.clear()
     p = q1("SELECT * FROM projects WHERE id=?", (pid,))
     b = InlineKeyboardBuilder()
@@ -603,7 +643,6 @@ async def np_ok(c: CallbackQuery, state: FSMContext):
     b.adjust(1)
     await show(c, f"✅ <b>Loyiha yaratildi!</b>\n\n{project_text(p)}", b.as_markup())
     await c.answer()
-
 
 # ---- Loyihalar ro'yxati va boshqaruv
 @admin.callback_query(F.data == "adm:list")
@@ -623,7 +662,6 @@ async def adm_list(c: CallbackQuery, state: FSMContext):
     await show(c, "📋 <b>Loyihalar</b>", b.as_markup())
     await c.answer()
 
-
 @admin.callback_query(F.data.startswith("adm:p:"))
 async def adm_project(c: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -634,13 +672,11 @@ async def adm_project(c: CallbackQuery, state: FSMContext):
     await show(c, project_text(p), project_kb(p["id"], p["status"]))
     await c.answer()
 
-
 def participants(pid):
     return q(
         "SELECT * FROM registrations WHERE project_id=? ORDER BY class, last_name, first_name",
         (pid,),
     )
-
 
 @admin.callback_query(F.data.startswith("adm:ppl:"))
 async def adm_people(c: CallbackQuery):
@@ -658,7 +694,6 @@ async def adm_people(c: CallbackQuery):
     await show(c, text, b.as_markup())
     await c.answer()
 
-
 @admin.callback_query(F.data.startswith("adm:csv:"))
 async def adm_csv(c: CallbackQuery):
     pid = int(c.data.split(":")[2])
@@ -671,7 +706,6 @@ async def adm_csv(c: CallbackQuery):
     data = ("\ufeff" + buf.getvalue()).encode("utf-8")  # Excel uchun BOM
     await c.message.answer_document(BufferedInputFile(data, filename=f"{p['name']}_qatnashuvchilar.csv"))
     await c.answer()
-
 
 @admin.callback_query(F.data.startswith("adm:lim:"))
 async def adm_limits(c: CallbackQuery, state: FSMContext):
@@ -689,7 +723,6 @@ async def adm_limits(c: CallbackQuery, state: FSMContext):
     )
     await c.answer()
 
-
 @admin.message(EditLimits.limits, F.text, ~F.text.startswith("/"))
 async def adm_limits_text(m: Message, state: FSMContext):
     pid = (await state.get_data())["pid"]
@@ -704,11 +737,9 @@ async def adm_limits_text(m: Message, state: FSMContext):
             await m.answer(f"⚠️ {r['cls']}-sinfdan {r['taken']} kishi yozilgan, limit undan kam bo'lmasin.")
             return
     for cls, seats in dist.items():
-        conn.execute("UPDATE project_classes SET seats=? WHERE project_id=? AND class=?", (seats, pid, cls))
-    conn.commit()
+        run("UPDATE project_classes SET seats=? WHERE project_id=? AND class=?", (seats, pid, cls))
     await state.clear()
     await m.answer("✅ Limitlar yangilandi.\n\n" + project_text(p), reply_markup=project_kb(pid, p["status"]))
-
 
 @admin.callback_query(F.data.startswith("adm:msg:"))
 async def adm_msg(c: CallbackQuery, state: FSMContext):
@@ -717,7 +748,6 @@ async def adm_msg(c: CallbackQuery, state: FSMContext):
     await state.update_data(pid=pid)
     await show(c, "📢 Loyiha qatnashuvchilariga yuboriladigan xabarni yozing:\n(Bekor qilish: /cancel)")
     await c.answer()
-
 
 @admin.message(Broadcast.text, F.text, ~F.text.startswith("/"))
 async def adm_msg_send(m: Message, state: FSMContext, bot: Bot):
@@ -728,7 +758,6 @@ async def adm_msg_send(m: Message, state: FSMContext, bot: Bot):
     ok, fail = await send_many(bot, ids, f"📢 <b>{esc(p['name'])}</b>\n\n{esc(m.text)}")
     await m.answer(f"Yuborildi: {ok} ta, yetmadi: {fail} ta.", reply_markup=project_kb(pid, p["status"]))
 
-
 @admin.callback_query(F.data.startswith("ann:"))
 async def adm_announce(c: CallbackQuery, bot: Bot):
     pid = int(c.data.split(":")[1])
@@ -737,7 +766,6 @@ async def adm_announce(c: CallbackQuery, bot: Bot):
     await c.answer("Yuborilmoqda...")
     ok, fail = await send_many(bot, ids, f"🆕 <b>Yangi loyiha!</b>\n\n{project_text(p, False)}\n\n/start bosib ro'yxatdan o'ting.")
     await c.message.answer(f"E'lon yuborildi: {ok} ta, yetmadi: {fail} ta.")
-
 
 @admin.callback_query(F.data.startswith("adm:close:"))
 async def adm_close(c: CallbackQuery):
@@ -749,7 +777,6 @@ async def adm_close(c: CallbackQuery):
     await show(c, "Loyiha yakunlansa, yangi ro'yxatdan o'tish yopiladi. Davom etasizmi?", b.as_markup())
     await c.answer()
 
-
 @admin.callback_query(F.data.startswith("adm:closeok:"))
 async def adm_close_ok(c: CallbackQuery):
     pid = int(c.data.split(":")[2])
@@ -757,7 +784,6 @@ async def adm_close_ok(c: CallbackQuery):
     p = q1("SELECT * FROM projects WHERE id=?", (pid,))
     await show(c, "🔒 Loyiha yakunlandi.\n\n" + project_text(p), project_kb(pid, "closed"))
     await c.answer()
-
 
 # ----------------------------------------------------------------- ISHGA TUSHIRISH (WEBHOOK)
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
@@ -773,7 +799,6 @@ async def main():
     dp.include_router(admin)
     dp.include_router(router)
 
-    # Render tomonidan avtomatik beriladigan tashqi URL va Port
     WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL")
     if not WEBHOOK_HOST:
         raise SystemExit("RENDER_EXTERNAL_URL topilmadi. Render'da Web Service sifatida ulanganingizga ishonch hosil qiling.")
@@ -784,12 +809,10 @@ async def main():
     WEB_SERVER_HOST = "0.0.0.0"
     WEB_SERVER_PORT = int(os.getenv("PORT", 8080))
 
-    # Telegram'ga webhook manzilini o'rnatamiz
     await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
 
     app = web.Application()
     
-    # Webhook so'rovlarini qabul qiluvchi handler
     webhook_requests_handler = SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
@@ -805,7 +828,6 @@ async def main():
     
     logging.info(f"Bot Webhook rejimida ishga tushdi: {WEBHOOK_URL}")
     
-    # Server to'xtamasligi uchun cheksiz kutish
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
