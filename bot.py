@@ -595,7 +595,8 @@ def preview_kb():
     b.adjust(1)
     return b.as_markup()
 
-@admin.callback_query(NewProject.confirm, F.data.in_({"np:ok", "np:edit", "np:back"}))
+# MUHIM O'ZGARISH: State'ga bog'liq qattiq cheklov olib tashlandi, shunchaki np: prefixi orqali to'g'ridan-to'g'ri ishlaydi
+@admin.callback_query(F.data.in_({"np:ok", "np:edit", "np:back"}))
 async def new_project_actions(c: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     sel = data.get("sel", [])
@@ -620,6 +621,10 @@ async def new_project_actions(c: CallbackQuery, state: FSMContext):
         
     elif c.data == "np:ok":
         d = await state.get_data()
+        if not d.get("name") or not d.get("dist"):
+            await c.answer("Xatolik: Ma'lumotlar topilmadi. Qaytadan /admin dan boshlang.", show_alert=True)
+            await state.clear()
+            return
         row = q1(
             "INSERT INTO projects(name, date, time, place, total, status, created_at) VALUES(?,?,?,?,?,'active',?) RETURNING id",
             (d["name"], d["date"], d["time"], d["place"], TOTAL_SEATS, now()),
