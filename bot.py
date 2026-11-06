@@ -12,7 +12,7 @@ import io
 import logging
 import os
 import re
-import sqlite3
+import psycopg2
 from datetime import datetime
 from html import escape as esc
 
@@ -45,90 +45,74 @@ DB_PATH = os.getenv("DB_PATH", "bot.db")
 logging.basicConfig(level=logging.INFO)
 
 # ----------------------------------------------------------------- BAZA
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-conn.row_factory = sqlite3.Row
-conn.executescript(
-    """
-CREATE TABLE IF NOT EXISTS users (
-    tg_id INTEGER PRIMARY KEY,
-    created_at TEXT
-);
-CREATE TABLE IF NOT EXISTS projects (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT, date TEXT, time TEXT, place TEXT,
-    total INTEGER, status TEXT DEFAULT 'active', created_at TEXT
-);
-CREATE TABLE IF NOT EXISTS project_classes (
-    project_id INTEGER, class INTEGER, seats INTEGER,
-    PRIMARY KEY (project_id, class)
-);
-CREATE TABLE IF NOT EXISTS registrations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    project_id INTEGER, tg_id INTEGER, username TEXT,
-    first_name TEXT, last_name TEXT, class INTEGER, created_at TEXT,
-    UNIQUE (project_id, tg_id)
-);
-"""
-)
-conn.commit()
+DATABASE_URL = os.getenv("DATABASE_URL")
 
+def get_db_connection():
+    url = DATABASE_URL
+    if url and url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    return psycopg2.connect(url)
+
+# Jadvallarni yaratish
+def init_db():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            tg_id BIGINT PRIMARY KEY,
+            created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS projects (
+            id SERIAL PRIMARY KEY,
+            name TEXT, date TEXT, time TEXT, place TEXT,
+            total INTEGER, status TEXT DEFAULT 'active', created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS project_classes (
+            project_id INTEGER, class INTEGER, seats INTEGER,
+            PRIMARY KEY (project_id, class)
+        );
+        CREATE TABLE IF NOT EXISTS registrations (
+            id SERIAL PRIMARY KEY,
+            project_id INTEGER, tg_id BIGINT, username TEXT,
+            first_name TEXT, last_name TEXT, class INTEGER, created_at TEXT,
+            UNIQUE (project_id, tg_id)
+        );
+        """
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+init_db()
 
 def q(sql, args=()):
-    return conn.execute(sql, args).fetchall()
-
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # psycopg2 da %s ishlatiladi (agar kodda ? bo'lsa, ularni %s ga o'zgartirish kerak)
+    sql = sql.replace("?", "%s")
+    cur.execute(sql, args)
+    rows = cur.fetchall()
+    # Dict formatida olish uchun
+    col_names = [desc[0] for desc in cur.description] if cur.description else []
+    result = [dict(zip(col_names, row)) for row in rows]
+    cur.close()
+    conn.close()
+    return result
 
 def q1(sql, args=()):
-    return conn.execute(sql, args).fetchone()
-
+    res = q(sql, args)
+    return res[0] if res else None
 
 def run(sql, args=()):
-    cur = conn.execute(sql, args)
+    conn = get_db_connection()
+    cur = conn.cursor()
+    sql = sql.replace("?", "%s")
+    cur.execute(sql, args)
     conn.commit()
+    cur.close()
+    conn.close()
     return cur
-
-
-def now():
-    return datetime.now().strftime("%Y-%m-%d %H:%M")
-
-
-def class_stats(pid):
-    return q(
-        """SELECT pc.class AS cls, pc.seats AS seats,
-           (SELECT COUNT(*) FROM registrations r
-             WHERE r.project_id = pc.project_id AND r.class = pc.class) AS taken
-           FROM project_classes pc WHERE pc.project_id = ? ORDER BY pc.class""",
-        (pid,),
-    )
-
-
-def seats_left(pid):
-    p = q1("SELECT total FROM projects WHERE id=?", (pid,))
-    taken = q1("SELECT COUNT(*) n FROM registrations WHERE project_id=?", (pid,))["n"]
-    return p["total"] - taken
-
-
-def split_seats(classes, total):
-    """Joylarni tanlangan sinflarga teng bo'lib chiqadi (qoldiq yuqori sinflarga)."""
-    classes = sorted(classes)
-    base, rem = divmod(total, len(classes))
-    res = {c: base for c in classes}
-    for c in classes[::-1][:rem]:
-        res[c] += 1
-    return res
-
-
-def parse_limits(text, allowed, total):
-    """'5=5, 6=11, 7=11' ko'rinishidagi matnni tekshiradi."""
-    pairs = re.findall(r"(\d+)\s*[=:]\s*(\d+)", text)
-    res = {int(a): int(b) for a, b in pairs}
-    if set(res) != set(allowed):
-        need = ", ".join(f"{c}=?" for c in sorted(allowed))
-        return None, f"Aynan shu sinflarni yozing: {need}"
-    if sum(res.values()) != total:
-        return None, f"Yig'indi {total} bo'lishi kerak, sizda {sum(res.values())} bo'ldi. Qaytadan yuboring."
-    return res, None
-
-
 # ----------------------------------------------------------------- MATNLAR
 def project_text(p, with_seats=True):
     t = (
