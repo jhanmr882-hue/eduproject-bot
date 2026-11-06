@@ -595,7 +595,6 @@ def preview_kb():
     b.adjust(1)
     return b.as_markup()
 
-# MUHIM O'ZGARISH: State'ga bog'liq qattiq cheklov olib tashlandi, shunchaki np: prefixi orqali to'g'ridan-to'g'ri ishlaydi
 @admin.callback_query(F.data.in_({"np:ok", "np:edit", "np:back"}))
 async def new_project_actions(c: CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -625,25 +624,33 @@ async def new_project_actions(c: CallbackQuery, state: FSMContext):
             await c.answer("Xatolik: Ma'lumotlar topilmadi. Qaytadan /admin dan boshlang.", show_alert=True)
             await state.clear()
             return
-        row = q1(
-            "INSERT INTO projects(name, date, time, place, total, status, created_at) VALUES(?,?,?,?,?,'active',?) RETURNING id",
-            (d["name"], d["date"], d["time"], d["place"], TOTAL_SEATS, now()),
-        )
-        pid = row["id"]
-        for cls, seats in d["dist"].items():
-            run("INSERT INTO project_classes(project_id, class, seats) VALUES(?,?,?)", (pid, int(cls), int(seats)))
-        await state.clear()
-        p = q1("SELECT * FROM projects WHERE id=?", (pid,))
-        b = InlineKeyboardBuilder()
-        b.button(text="📣 Hammaga e'lon qilish", callback_data=f"ann:{pid}")
-        b.button(text="🛡 Admin panel", callback_data="adm:home")
-        b.adjust(1)
-        text = f"✅ <b>Loyiha yaratildi!</b>\n\n{project_text(p)}"
+        
         try:
-            await c.message.edit_text(text, reply_markup=b.as_markup())
-        except Exception:
-            await c.message.answer(text, reply_markup=b.as_markup())
-        await c.answer()
+            res = q1(
+                "INSERT INTO projects(name, date, time, place, total, status, created_at) VALUES(%s, %s, %s, %s, %s, 'active', %s) RETURNING id",
+                (d["name"], d["date"], d["time"], d["place"], TOTAL_SEATS, now()),
+            )
+            pid = res["id"] if isinstance(res, dict) else res[0]
+
+            for cls, seats in d["dist"].items():
+                run("INSERT INTO project_classes(project_id, class, seats) VALUES(%s, %s, %s)", (pid, int(cls), int(seats)))
+            
+            await state.clear()
+            p = q1("SELECT * FROM projects WHERE id=%s", (pid,))
+            b = InlineKeyboardBuilder()
+            b.button(text="📣 Hammaga e'lon qilish", callback_data=f"ann:{pid}")
+            b.button(text="🛡 Admin panel", callback_data="adm:home")
+            b.adjust(1)
+            text = f"✅ <b>Loyiha yaratildi!</b>\n\n{project_text(p)}"
+            
+            try:
+                await c.message.edit_text(text, reply_markup=b.as_markup())
+            except Exception:
+                await c.message.answer(text, reply_markup=b.as_markup())
+            await c.answer()
+        except Exception as e:
+            logging.error(f"Loyiha yaratishda xato: {e}")
+            await c.answer(f"Xatolik yuz berdi: {e}", show_alert=True)
 
 @admin.message(NewProject.limits, F.text, ~F.text.startswith("/"))
 async def np_limits(m: Message, state: FSMContext):
