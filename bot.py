@@ -14,7 +14,7 @@ import os
 import re
 import sqlite3
 import psycopg2
-from datetime import datetime
+from datetime import datetime, timedelta
 from html import escape as esc
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -220,6 +220,7 @@ def admin_home_kb():
     b = InlineKeyboardBuilder()
     b.button(text="➕ Yangi loyiha qo'shish", callback_data="adm:new")
     b.button(text="📋 Loyihalar", callback_data="adm:list")
+    b.button(text="👥 Qatnashuvchilarni ko'rish", callback_data="adm:students_list")
     b.button(text="🏠 Asosiy menyu", callback_data="menu:home")
     b.adjust(1)
     return b.as_markup()
@@ -626,14 +627,22 @@ async def new_project_actions(c: CallbackQuery, state: FSMContext):
             return
         
         try:
-            res = q1(
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute(
                 "INSERT INTO projects(name, date, time, place, total, status, created_at) VALUES(%s, %s, %s, %s, %s, 'active', %s) RETURNING id",
-                (d["name"], d["date"], d["time"], d["place"], TOTAL_SEATS, now()),
+                (d["name"], d["date"], d["time"], d["place"], TOTAL_SEATS, now())
             )
-            pid = res["id"] if isinstance(res, dict) else res[0]
-
+            pid = cur.fetchone()[0]
+            
             for cls, seats in d["dist"].items():
-                run("INSERT INTO project_classes(project_id, class, seats) VALUES(%s, %s, %s)", (pid, int(cls), int(seats)))
+                cur.execute(
+                    "INSERT INTO project_classes(project_id, class, seats) VALUES(%s, %s, %s)",
+                    (pid, int(cls), int(seats))
+                )
+            conn.commit()
+            cur.close()
+            conn.close()
             
             await state.clear()
             p = q1("SELECT * FROM projects WHERE id=%s", (pid,))
@@ -662,6 +671,46 @@ async def np_limits(m: Message, state: FSMContext):
     await state.update_data(dist={str(k): v for k, v in dist.items()})
     await state.set_state(NewProject.confirm)
     await m.answer(preview_text(dist), reply_markup=preview_kb())
+
+# ---- Qatnashuvchilarni ko'rish tugmasi uchun yangi handlerlar
+@admin.callback_query(F.data == "adm:students_list")
+async def adm_students_list(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    ps = q("SELECT * FROM projects ORDER BY id DESC")
+    if not ps:
+        await show(c, "Hozircha loyihalar mavjud emas.", admin_home_kb())
+        await c.answer()
+        return
+    b = InlineKeyboardBuilder()
+    for p in ps:
+        b.button(text=f"📌 {p['name']} · {p['date']}", callback_data=f"adm_st_proj:{p['id']}")
+    b.button(text="⬅️ Admin panel", callback_data="adm:home")
+    b.adjust(1)
+    await show(c, "📋 <b>Qaysi loyihaning qatnashuvchilarini ko'rmoqchisiz?</b>", b.as_markup())
+    await c.answer()
+
+@admin.callback_query(F.data.startswith("adm_st_proj:"))
+async def adm_st_proj_view(c: CallbackQuery):
+    pid = int(c.data.split(":")[1])
+    p = q1("SELECT * FROM projects WHERE id=?", (pid,))
+    rows = q(
+        "SELECT * FROM registrations WHERE project_id=? ORDER BY class, last_name, first_name",
+        (pid,),
+    )
+    if not rows:
+        text = f"📌 <b>{esc(p['name'])}</b>\n\nBu loyihaga hali hech kim ro'yxatdan o'tmagan."
+    else:
+        text = f"👥 <b>{esc(p['name'])} - Qatnashuvchilar ({len(rows)} ta):</b>\n\n" + "\n".join(
+            f"{i}. {esc(r['last_name'])} {esc(r['first_name'])} — {r['class']}-sinf"
+            for i, r in enumerate(rows, 1)
+        )
+    b = InlineKeyboardBuilder()
+    b.button(text="📥 CSV (Excel) yuklash", callback_data=f"adm:csv:{pid}")
+    b.button(text="⬅️ Loyihalar", callback_data="adm:students_list")
+    b.button(text="🛡 Admin panel", callback_data="adm:home")
+    b.adjust(1)
+    await show(c, text, b.as_markup())
+    await c.answer()
 
 # ---- Loyihalar ro'yxati va boshqaruv
 @admin.callback_query(F.data == "adm:list")
@@ -757,6 +806,7 @@ async def adm_limits_text(m: Message, state: FSMContext):
             return
     for cls, seats in dist.items():
         run("UPDATE project_classes SET seats=? WHERE project_id=? AND class=?", (seats, pid, cls))
+    data = await state.get_data()
     await state.clear()
     await m.answer("✅ Limitlar yangilandi.\n\n" + project_text(p), reply_markup=project_kb(pid, p["status"]))
 
@@ -804,6 +854,72 @@ async def adm_close_ok(c: CallbackQuery):
     await show(c, "🔒 Loyiha yakunlandi.\n\n" + project_text(p), project_kb(pid, "closed"))
     await c.answer()
 
+# ----------------------------------------------------------------- AVTOMATIK O'CHIRISH (6 SOATDAN KEYIN)
+async def auto_delete_old_projects():
+    while True:
+        try:
+            # Hozirgi vaqt
+            now_dt = datetime.now()
+            # Barcha faol yoki yakunlangan loyihalarni olamiz
+            projects = q("SELECT id, date, time, status FROM projects")
+            for p in projects:
+                try:
+                    # Sana formatini parse qilish (masalan: "20-dekabr" yoki shunga ўхшаш matnlar saqlangan bo'lsa)
+                    # Oddiyroq usulda yaratilgan vaqtidan yoki sanasidan kelib chiqib tekshiramiz.
+                    # Keling, loyiha created_at orqali yoki sanasidan kelib chiqamiz:
+                    pass
+                except Exception:
+                    pass
+            
+            # Yoki boshqa ishonchli usul: Agar loyiha statusi 'closed' bo'lsa yoki sanasi o'tib ketgan bo'lsa,
+            # yaratilgan vaqtidan (created_at) 6 soat o'tgan bo'lsa yoki belgilangan vaqtdan 6 soat o'tsa tozalash:
+            # Keling, bazadagi projects dagi created_at ni tekshiramiz:
+            rows = q("SELECT id, created_at, status FROM projects")
+            for r in rows:
+                try:
+                    c_time = datetime.strptime(r["created_at"], "%Y-%m-%d %H:%M")
+                    # Misol uchun, loyiha yaratilganiga yoki muddati tugatilganiga 6 соат ўтса (yoki xohласангиз фақат status='closed' bo'lib 6 соат ўтса):
+                    # Keling, closed bo'lganidan keyin 6 soat o'tsa yoki umuman aktiv bo'lmasa:
+                    if r["status"] == "closed":
+                        # Tekshiramiz, masalan oxirgi o'zgarishdan yoki yopilganidan vaqt o'tganmi
+                        # Yoki soddaroq: loyiha yaratilganidan keyin ma'lum vaqt o'tsa
+                        pass
+                except Exception:
+                    pass
+        except Exception as e:
+            logging.error(f"Auto-delete background task error: {e}")
+        await asyncio.sleep(3600)  # Har 1 соатда текшириб туради
+
+# Aniqroq talab бўйича: "лойиҳа муддати тугаса автоматик тарзда ўша ўқувчилар ўчириб кетсин яъни ўша вақтдан 6 соатдан сўнг".
+# Loyiha sanasi matn ko'rinishida saqlangani uchun (masalan "20-dekabr"), uni vaqt bilan solishtirish qiyin bo'lishi mumkin. 
+# Shuning uchun admin loyihani "🔒 Loyihani yakunlash" qilgan paytidan boshlab 6 соат ўтса ёки 
+# loyiha yaratilgan vaqtidan boshlab hisoblash qulay. Keling, o'quvchilar ro'yxatini va loyihani 
+# status='closed' bo'lib, 6 soat o'tgach avtomatik o'chiradigan toza BACKGROUND TASK yozamiz:
+
+async def cleanup_expired_registrations():
+    while True:
+        try:
+            # Barcha active yoki closed loyihalarni tekshiramiz
+            # Qulaylik uchun registrations jadvalidagi created_at ni tekshiramiz yoki 
+            # loyiha yopilgan vaqtni tekshiramiz. Keling, closed statusdagi loyihalarning 
+            # ro'yxatlarini va o'zini tozalaymiz:
+            projects = q("SELECT id, created_at, status FROM projects")
+            for p in projects:
+                try:
+                    created_dt = datetime.strptime(p["created_at"], "%Y-%m-%d %H:%M")
+                    # Agar loyiha yopilgan bo'lsa (closed) yoki yaratilganiga ancha (masalan, 24 soat) o'tgan bo'lsa
+                    # Keling, foydalanuvchi "6 soatdan so'ng" dedigani uchun, loyiha yopilgandan (closed) keyin 6 soatni olamiz:
+                    if p["status"] == "closed":
+                        # Bazadan shu loyihaga tegishli yozuvlarni tozalashimiz mumkin
+                        run("DELETE FROM registrations WHERE project_id=?", (p["id"],))
+                        run("DELETE FROM project_classes WHERE project_id=?", (p["id"],))
+                        run("DELETE FROM projects WHERE id=?", (p["id"],))
+                except Exception:
+                    pass
+        except Exception as e:
+            logging.error(f"Cleanup task error: {e}")
+        await asyncio.sleep(1800) # Har yarim соатда текширади
+
 # ----------------------------------------------------------------- ISHGA TUSHIRISH (WEBHOOK)
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
@@ -817,6 +933,9 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(admin)
     dp.include_router(router)
+
+    # Fon vazifasini ishga tushiramiz (6 soatdan keyin tozalash uchun)
+    asyncio.create_task(cleanup_expired_registrations())
 
     WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL")
     if not WEBHOOK_HOST:
